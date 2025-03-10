@@ -1,10 +1,8 @@
 # DeProp - Decentralized Property Booking Platform
 
-This is an MVP for a decentralized property booking platform that allows users to invest in properties using USDT and book stays.
+This is an MVP for a decentralized property booking platform that allows users to invest in properties using ETH(scroll sepolia) and book stays.
 
-## Getting Started
+try at:https://v0-new-project-sozzkrcn1ob.vercel.app/
 
-1. Clone the repository
-2. Install dependencies: `npm install`
-3. Create a `.env.local` file in the root directory and add:
+deployed contract file name:
 
