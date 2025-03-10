@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract DePropOrder {
+    // 订单状态枚举
+    enum OrderStatus { Pending, Confirmed, Cancelled }
+    
+    // 订单结构体：记录每笔投资订单的基本信息
+    struct Order {
+        uint256 orderId;
+        uint256 projectId;
+        uint256 amount;       // 投资金额（单位 wei）
+        address buyer;
+        address seller;
+        OrderStatus status;
+    }
+    
+    // 投资项目结构体：记录每个项目的资金池信息
+    struct Project {
+        uint256 projectId;
+        uint256 totalInvestment; // 当前项目累计投资金额
+        uint256 poolThreshold;   // 资金池门槛（达到此金额后可释放资金）
+        address factoryAccount;  // 工厂账户地址，资金释放后转入该地址
+        bool fundsReleased;      // 资金是否已释放
+        uint256 investorCount;   // 参与投资的用户数量（假设每个用户每个项目只有一笔订单）
+    }
+    
+    uint256 public nextOrderId;
+    
+    // 存储订单和项目数据
+    mapping(uint256 => Order) public orders;         // orderId => Order
+    mapping(uint256 => Project) public projects;       // projectId => Project
+
+    // 事件
+    event OrderPlaced(uint256 orderId, uint256 projectId, address buyer, address seller, uint256 amount);
+    event OrderConfirmed(uint256 orderId, uint256 projectId, address buyer);
+    event OrderCancelled(uint256 orderId, uint256 projectId, address buyer);
+    event InvestmentAdjusted(uint256 orderId, uint256 newAmount);
+    event FundsReleased(uint256 projectId, uint256 totalInvestment);
+    
+    // 限定只有订单的买家可以调用的修饰器
+    modifier onlyBuyer(uint256 _orderId) {
+        require(msg.sender == orders[_orderId].buyer, "Not the order buyer");
+        _;
+    }
+    
+    // 1. 下单：创建投资订单，资金暂未转入共享钱包
+    function placeOrder(uint256 _projectId, address _seller) external payable {
+        require(msg.value > 0, "Investment must be greater than 0");
+        
+        orders[nextOrderId] = Order({
+            orderId: nextOrderId,
+            projectId: _projectId,
+            amount: msg.value,
+            buyer: msg.sender,
+            seller: _seller,
+            status: OrderStatus.Pending
+        });
+        emit OrderPlaced(nextOrderId, _projectId, msg.sender, _seller, msg.value);
+        
+        // 更新项目的投资数据
+        Project storage proj = projects[_projectId];
+        // 若项目未初始化，则初始化项目数据
+        if (proj.projectId == 0) {
+            proj.projectId = _projectId;
+            proj.poolThreshold = 1 ether; // 示例：1 ETH作为资金池门槛
+            proj.factoryAccount = address(0); // 待后续设置
+            proj.fundsReleased = false;
+            proj.totalInvestment = 0;
+            proj.investorCount = 0;
+        }
+        proj.totalInvestment += msg.value;
+        proj.investorCount += 1; // 假设每个投资者在每个项目只有一笔订单
+        
+        nextOrderId++;
+    }
+    
+    // 2. 确认订单：买家点击 Confirm 按钮，资金视作转入共享钱包，更新订单状态
+    function confirmOrder(uint256 _orderId) external onlyBuyer(_orderId) {
+        Order storage order = orders[_orderId];
+        require(order.status == OrderStatus.Pending, "Order not pending");
+        order.status = OrderStatus.Confirmed;
+        emit OrderConfirmed(_orderId, order.projectId, msg.sender);
+        // 此处资金已保存在合约余额中，视作已转入共享钱包
+    }
+    
+    // 3. 取消订单：订单处于 Pending 状态时，买家可以取消订单并退回资金
+    function cancelOrder(uint256 _orderId) external onlyBuyer(_orderId) {
+        Order storage order = orders[_orderId];
+        require(order.status == OrderStatus.Pending, "Order cannot be cancelled");
+        order.status = OrderStatus.Cancelled;
+        payable(order.buyer).transfer(order.amount);
+        // 更新项目投资数据
+        Project storage proj = projects[order.projectId];
+        proj.totalInvestment -= order.amount;
+        emit OrderCancelled(_orderId, order.projectId, msg.sender);
+    }
+    
+    // 4. 调整投资金额：允许买家在订单 Pending 状态下增加或减少投资金额
+    function adjustInvestment(uint256 _orderId, uint256 _newAmount) external payable onlyBuyer(_orderId) {
+        Order storage order = orders[_orderId];
+        require(order.status == OrderStatus.Pending, "Cannot adjust a confirmed order");
+        Project storage proj = projects[order.projectId];
+        
+        if (_newAmount > order.amount) {
+            uint256 diff = _newAmount - order.amount;
+            require(msg.value == diff, "Send additional funds equal to difference");
+            order.amount = _newAmount;
+            proj.totalInvestment += diff;
+        } else {
+            uint256 diff = order.amount - _newAmount;
+            order.amount = _newAmount;
+            proj.totalInvestment -= diff;
+            payable(msg.sender).transfer(diff);
+        }
+        emit InvestmentAdjusted(_orderId, _newAmount);
+    }
+    
+    // 5. 提取投资：在订单 Pending 状态下允许买家撤回全部投资
+    function withdrawInvestment(uint256 _orderId) external onlyBuyer(_orderId) {
+        Order storage order = orders[_orderId];
+        require(order.status == OrderStatus.Pending, "Cannot withdraw a confirmed order");
+        uint256 amount = order.amount;
+        order.amount = 0;
+        order.status = OrderStatus.Cancelled;
+        Project storage proj = projects[order.projectId];
+        proj.totalInvestment -= amount;
+        payable(msg.sender).transfer(amount);
+        emit OrderCancelled(_orderId, order.projectId, msg.sender);
+    }
+    
+    // 6. 释放资金：当共享钱包中的资金达到门槛后，将资金转移到工厂账户
+    function releaseFunds(uint256 _projectId) external {
+        Project storage proj = projects[_projectId];
+        require(proj.totalInvestment >= proj.poolThreshold, "Insufficient funds in pool");
+        require(!proj.fundsReleased, "Funds already released");
+        require(proj.factoryAccount != address(0), "Factory account not set");
+        proj.fundsReleased = true;
+        uint256 amount = proj.totalInvestment;
+        payable(proj.factoryAccount).transfer(amount);
+        emit FundsReleased(_projectId, amount);
+    }
+    
+    // 7. 管理员设置项目详情：设定工厂账户地址和资金池门槛
+    function setProjectDetails(uint256 _projectId, address _factoryAccount, uint256 _poolThreshold) external {
+        // 实际部署时应添加 onlyOwner 修饰符来限制权限
+        Project storage proj = projects[_projectId];
+        proj.factoryAccount = _factoryAccount;
+        proj.poolThreshold = _poolThreshold;
+    }
+}
